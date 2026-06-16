@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Task Manager</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f9f9f7; color: #1a1a1a; min-height: 100vh; }
+  input, select, textarea, button { font-family: inherit; font-size: 13px; border: 0.5px solid #ccc; border-radius: 8px; padding: 6px 10px; outline: none; background: #fff; color: #1a1a1a; }
+  input:focus, select:focus, textarea:focus { border-color: #888; box-shadow: 0 0 0 2px rgba(0,0,0,0.06); }
+  button { cursor: pointer; background: #fff; border: 0.5px solid #ccc; transition: background 0.1s; }
+  button:hover { background: #f3f3f1; }
+  button:active { transform: scale(0.98); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  textarea { resize: vertical; min-height: 60px; width: 100%; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #1a1a1a; color: #f0f0ee; }
+    input, select, textarea, button { background: #2a2a2a; color: #f0f0ee; border-color: #444; }
+    button:hover { background: #333; }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+
+// ── REPLACE THESE ─────────────────────────────────────────
+const SUPABASE_URL = "https://znzqaiubvbtkfarsyovd.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpuenFhaXVidmJ0a2ZhcnN5b3ZkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODE2MDAzMzEsImV4cCI6MjA5NzE3NjMzMX0.9pZaQOvBDsk2v6IOF7SMvU6a-Ad6yyHbe_eweUzYRtg";
+// ─────────────────────────────────────────────────────────
+
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ── Supabase ──────────────────────────────────────────────
+const sbFetch = async (path, opts = {}) => {
+  const base = SUPABASE_URL.replace(/\/rest\/v1\/?$/, "");
+  const res = await fetch(`${base}/rest/v1${path}`, {
+    ...opts,
+    headers: { "apikey": SUPABASE_KEY, "Authorization": `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json", "Prefer": "return=representation", ...(opts.headers||{}) },
+  });
+  const text = await res.text();
+  try { return { ok: res.ok, status: res.status, data: text ? JSON.parse(text) : null }; }
+  catch { return { ok: res.ok, status: res.status, data: null }; }
+};
+const getUser     = async u => { const r = await sbFetch(`/users?username=eq.${encodeURIComponent(u)}&limit=1`); return r.ok && r.data?.length ? r.data[0] : null; };
+const createUser  = async (u, ph) => { const r = await sbFetch("/users", { method:"POST", body: JSON.stringify({ username:u, password_hash:ph, data:{ tasks:[], calBlocks:[], elapsed:{}, history:[] } }) }); if(!r.ok) throw new Error(`Supabase ${r.status}: ${JSON.stringify(r.data)}`); return r.data?.[0]??null; };
+const saveUserData= async (u, data) => { await sbFetch(`/users?username=eq.${encodeURIComponent(u)}`, { method:"PATCH", body: JSON.stringify({ data, updated_at: new Date().toISOString() }) }); };
+const hashPassword= async p => { const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(p)); return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join(""); };
+
+// ── Constants ─────────────────────────────────────────────
+const PRIORITIES  = ["high","medium","low"];
+const RECUR_OPTS  = ["none","daily","monday","tuesday","wednesday","thursday","friday","weekdays"];
+const PC = { high:{bg:"#FCEBEB",text:"#A32D2D",border:"#F09595",cal:"#F7C1C1",calText:"#791F1F"}, medium:{bg:"#FAEEDA",text:"#854F0B",border:"#EF9F27",cal:"#FAC775",calText:"#633806"}, low:{bg:"#EAF3DE",text:"#3B6D11",border:"#97C459",cal:"#C0DD97",calText:"#27500A"} };
+const SS  = { "not started":{bg:"#f3f3f1",text:"#666",border:"#ccc"}, "in progress":{bg:"#E6F1FB",text:"#185FA5",border:"#378ADD"}, "completed":{bg:"#EAF3DE",text:"#3B6D11",border:"#97C459"} };
+const CAL_START=7, CAL_END=17.5, SLOT_H=50, SLOTS_PER_HOUR=4;
+const TOTAL_SLOTS=Math.round((CAL_END-CAL_START)*SLOTS_PER_HOUR), CAL_H=TOTAL_SLOTS*SLOT_H, HOUR_H=SLOTS_PER_HOUR*SLOT_H;
+const DAYS = ["Monday","Tuesday","Wednesday","Thursday","Friday"];
+
+// ── Helpers ───────────────────────────────────────────────
+const hToY   = h  => (h-CAL_START)*HOUR_H;
+const yToH   = px => CAL_START+px/HOUR_H;
+const snapH  = h  => Math.round(h*SLOTS_PER_HOUR)/SLOTS_PER_HOUR;
+const fmt    = h  => { const hr=Math.floor(h),min=Math.round((h%1)*60); return `${hr%12||12}:${String(min).padStart(2,"0")}${hr<12?"am":"pm"}`; };
+const fmtDur = m  => m<60?`${m}m`:`${Math.floor(m/60)}h${m%60?` ${m%60}m`:""}`;
+const fmtMs  = ms => { const s=Math.floor(ms/1000),m=Math.floor(s/60),h=Math.floor(m/60); return h>0?`${h}h ${m%60}m`:`${m}m ${s%60}s`; };
+const msToH  = ms => ms/3_600_000;
+const slugify= s  => s.toLowerCase().replace(/[^a-z0-9_-]/g,"").slice(0,32);
+const toDateStr = d => d.toISOString().slice(0,10);
+const todayStr  = () => toDateStr(new Date());
+
+// Get Mon–Fri dates for the week containing a given date
+const getWeekDays = (refDate) => {
+  const d = new Date(refDate);
+  const day = d.getDay(); // 0=Sun
+  const mon = new Date(d);
+  mon.setDate(d.getDate() - (day===0 ? 6 : day-1));
+  return Array.from({length:5}, (_,i) => { const x=new Date(mon); x.setDate(mon.getDate()+i); return x; });
+};
+
+const dayLabel = d => { const today=todayStr(); const ds=toDateStr(d); if(ds===today) return "Today"; const tomorrow=new Date(); tomorrow.setDate(tomorrow.getDate()+1); if(ds===toDateStr(tomorrow)) return "Tomorrow"; return d.toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"}); };
+
+// Check if a task recurs on a given date
+const taskRecursOn = (task, dateStr) => {
+  if(!task.recur||task.recur==="none") return false;
+  const d = new Date(dateStr);
+  const dayName = DAYS[d.getDay()-1]?.toLowerCase();
+  if(task.recur==="daily") return true;
+  if(task.recur==="weekdays") return d.getDay()>=1&&d.getDay()<=5;
+  return task.recur===dayName;
+};
+
+function reflow(blocks, activeTaskId, clockOnH, actualDurH) {
+  const active=blocks.find(b=>b.taskId===activeTaskId); if(!active) return blocks;
+  const others=blocks.filter(b=>b.taskId!==activeTaskId).sort((a,b)=>(a.origStart??a.startH)-(b.origStart??b.startH));
+  const result=[{...active,startH:clockOnH,durH:actualDurH}]; let cursor=clockOnH+actualDurH;
+  for(const b of others){const orig=b.origStart??b.startH;if(orig>=cursor){result.push({...b,startH:orig,pushed:false});cursor=orig+b.durH;}else{result.push({...b,startH:cursor,pushed:true});cursor+=b.durH;}}
+  return result;
+}
+
+// ── Badge ─────────────────────────────────────────────────
+const Badge = ({label,bg,text,border}) => <span style={{background:bg,color:text,border:`0.5px solid ${border}`,borderRadius:6,fontSize:11,padding:"2px 8px",fontWeight:500,whiteSpace:"nowrap"}}>{label}</span>;
+
+// ── Login ─────────────────────────────────────────────────
+function LoginScreen({onLogin}) {
+  const [username,setUsername]=useState(""); const [password,setPassword]=useState("");
+  const [mode,setMode]=useState("login"); const [error,setError]=useState(""); const [loading,setLoading]=useState(false);
+  const handle=async()=>{
+    const u=slugify(username),p=password.trim();
+    if(!u){setError("Username required.");return;} if(p.length<4){setError("Password must be at least 4 characters.");return;}
+    setLoading(true);setError("");
+    try{
+      const hash=await hashPassword(p);
+      if(mode==="register"){
+        const existing=await getUser(u); if(existing){setError("Username already taken.");setLoading(false);return;}
+        const created=await createUser(u,hash); if(!created){setError("Failed to create account.");setLoading(false);return;}
+        onLogin(u,{tasks:[],calBlocks:[],elapsed:{},history:[]});
+      }else{
+        const user=await getUser(u); if(!user){setError("Account not found.");setLoading(false);return;}
+        if(user.password_hash!==hash){setError("Incorrect password.");setLoading(false);return;}
+        onLogin(u,user.data||{tasks:[],calBlocks:[],elapsed:{},history:[]});
+      }
+    }catch(e){setError(`Error: ${e.message}`);} setLoading(false);
+  };
+  return (
+    <div style={{maxWidth:360,margin:"4rem auto",padding:"0 1rem"}}>
+      <h1 style={{fontSize:24,fontWeight:600,marginBottom:4}}>Task Manager</h1>
+      <p style={{fontSize:13,color:"#888",marginBottom:24}}>Sign in to sync tasks across all your devices.</p>
+      <div style={{border:"0.5px solid #ddd",borderRadius:12,padding:"1.25rem"}}>
+        <div style={{display:"flex",gap:4,marginBottom:20}}>
+          {[["login","Sign in"],["register","Create account"]].map(([m,l])=>(
+            <button key={m} onClick={()=>{setMode(m);setError("");}} style={{flex:1,padding:"7px 0",fontWeight:mode===m?600:400,background:mode===m?"#f3f3f1":"transparent",border:"0.5px solid #ddd"}}>{l}</button>
+          ))}
+        </div>
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <div><label style={{fontSize:12,color:"#888",display:"block",marginBottom:4}}>Username</label><input value={username} onChange={e=>setUsername(slugify(e.target.value))} placeholder="e.g. johndoe" style={{width:"100%"}} onKeyDown={e=>e.key==="Enter"&&handle()} /></div>
+          <div><label style={{fontSize:12,color:"#888",display:"block",marginBottom:4}}>Password</label><input type="password" value={password} onChange={e=>setPassword(e.target.value)} placeholder="Min. 4 characters" style={{width:"100%"}} onKeyDown={e=>e.key==="Enter"&&handle()} /></div>
+          {error&&<p style={{fontSize:12,color:"#c0392b",margin:0}}>{error}</p>}
+          <button onClick={handle} disabled={loading} style={{padding:"9px 0",fontWeight:600,marginTop:4}}>{loading?"Please wait…":mode==="login"?"Sign in":"Create account"}</button>
+        </div>
+      </div>
+      <p style={{fontSize:11,color:"#aaa",textAlign:"center",marginTop:12}}>Passwords hashed with SHA-256 before storage.</p>
+    </div>
+  );
+}
+
+// ── History Tab ───────────────────────────────────────────
+function HistoryTab({history,tasks}) {
+  const byDate = useMemo(()=>{
+    const map={};
+    for(const h of history){
+      if(!map[h.date]) map[h.date]=[];
+      map[h.date].push(h);
+    }
+    return Object.entries(map).sort((a,b)=>b[0].localeCompare(a[0]));
+  },[history]);
+
+  const taskTotals = useMemo(()=>{
+    const map={};
+    for(const h of history){ map[h.taskId]=(map[h.taskId]||0)+h.durationMs; }
+    return map;
+  },[history]);
+
+  if(history.length===0) return <p style={{fontSize:13,color:"#888",padding:"1rem 0"}}>No time tracked yet. Clock on to tasks to start recording history.</p>;
+
+  return (
+    <div>
+      <h3 style={{fontSize:15,fontWeight:500,marginBottom:"1rem"}}>Total time per task</h3>
+      <div style={{border:"0.5px solid #ddd",borderRadius:12,overflow:"hidden",marginBottom:"1.5rem"}}>
+        {Object.entries(taskTotals).map(([tid,ms],i,arr)=>{
+          const task=tasks.find(t=>t.id===Number(tid)||t.id===tid);
+          return (
+            <div key={tid} style={{display:"flex",alignItems:"center",gap:10,padding:"0.6rem 1rem",borderBottom:i<arr.length-1?"0.5px solid #eee":"none",background:"#fff"}}>
+              <span style={{flex:1,fontSize:13}}>{task?.text||"Deleted task"}</span>
+              {task&&<Badge label={task.priority} bg={PC[task.priority].bg} text={PC[task.priority].text} border={PC[task.priority].border}/>}
+              <span style={{fontSize:13,fontWeight:500,color:"#185FA5"}}>{fmtMs(ms)}</span>
+            </div>
+          );
+        })}
+      </div>
+
+      <h3 style={{fontSize:15,fontWeight:500,marginBottom:"1rem"}}>Session log</h3>
+      {byDate.map(([date,sessions])=>(
+        <div key={date} style={{marginBottom:"1.25rem"}}>
+          <p style={{fontSize:12,fontWeight:600,color:"#888",marginBottom:6}}>{new Date(date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long",year:"numeric"}).toUpperCase()}</p>
+          <div style={{border:"0.5px solid #ddd",borderRadius:12,overflow:"hidden"}}>
+            {sessions.sort((a,b)=>a.startTime-b.startTime).map((s,i)=>{
+              const task=tasks.find(t=>t.id===s.taskId||t.id===Number(s.taskId));
+              return (
+                <div key={i} style={{display:"flex",alignItems:"center",gap:10,padding:"0.55rem 1rem",borderBottom:i<sessions.length-1?"0.5px solid #eee":"none",background:"#fff"}}>
+                  <span style={{fontSize:13,flex:1}}>{task?.text||"Deleted task"}</span>
+                  <span style={{fontSize:11,color:"#aaa",whiteSpace:"nowrap"}}>{new Date(s.startTime).toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})} – {new Date(s.endTime).toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})}</span>
+                  <span style={{fontSize:12,fontWeight:500,color:"#185FA5",whiteSpace:"nowrap"}}>{fmtMs(s.durationMs)}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────
+function App() {
+  const [user,setUser]=useState(null);
+  const [tasks,setTasks]=useState([]);
+  const [input,setInput]=useState("");
+  const [priority,setPriority]=useState("medium");
+  const [duration,setDuration]=useState(30);
+  const [recur,setRecur]=useState("none");
+  const [calBlocks,setCalBlocks]=useState([]); // {id,taskId,startH,durH,origDurH,origStart,date,pushed}
+  const [activeTimer,setActiveTimer]=useState(null); // {taskId,startedAt,clockOnH}
+  const [elapsed,setElapsed]=useState({});
+  const [history,setHistory]=useState([]); // {taskId,date,startTime,endTime,durationMs}
+  const [now,setNow]=useState(Date.now());
+  const [tab,setTab]=useState("tasks");
+  const [aiResponse,setAiResponse]=useState("");
+  const [aiLoading,setAiLoading]=useState(false);
+  const [dragTask,setDragTask]=useState(null);
+  const [dragBlock,setDragBlock]=useState(null);
+  const [dragOffsetY,setDragOffsetY]=useState(0);
+  const [dragTargetDate,setDragTargetDate]=useState(null);
+  const [dropPreview,setDropPreview]=useState(null); // {startH,durH,date}
+  const [editingId,setEditingId]=useState(null);
+  const [saveStatus,setSaveStatus]=useState("");
+  const [calView,setCalView]=useState("day"); // "day"|"week"
+  const [weekRef,setWeekRef]=useState(new Date());
+  const calRefs=useRef({});
+  const saveTimer=useRef(null);
+
+  const weekDays = useMemo(()=>getWeekDays(weekRef),[weekRef]);
+  const todayISO = todayStr();
+
+  // Login
+  const handleLogin=(u,data)=>{
+    setUser(u);
+    setTasks((data.tasks||[]).map(t=>({status:"not started",recur:"none",notes:"",...t})));
+    setCalBlocks(data.calBlocks||[]);
+    setElapsed(data.elapsed||{});
+    setHistory(data.history||[]);
+  };
+
+  // Save
+  const saveData=useCallback((t,cb,el,h)=>{
+    if(!user) return;
+    clearTimeout(saveTimer.current);
+    setSaveStatus("saving");
+    saveTimer.current=setTimeout(async()=>{
+      try{ await saveUserData(user,{tasks:t,calBlocks:cb,elapsed:el,history:h}); setSaveStatus("saved"); setTimeout(()=>setSaveStatus(""),2500); }
+      catch{ setSaveStatus("error"); }
+    },1200);
+  },[user]);
+
+  useEffect(()=>{ saveData(tasks,calBlocks,elapsed,history); },[tasks,calBlocks,elapsed,history]);
+
+  // Tick
+  useEffect(()=>{
+    const id=setInterval(()=>{
+      const n=Date.now(); setNow(n);
+      if(!activeTimer?.startedAt) return;
+      setCalBlocks(prev=>{
+        const ab=prev.find(b=>b.taskId===activeTimer.taskId); if(!ab) return prev;
+        const totalMs=(elapsed[activeTimer.taskId]||0)+(n-activeTimer.startedAt);
+        return reflow(prev.filter(b=>b.date===ab.date),activeTimer.taskId,activeTimer.clockOnH,Math.max(ab.origDurH??ab.durH,msToH(totalMs))).concat(prev.filter(b=>b.date!==ab.date));
+      });
+    },1000);
+    return ()=>clearInterval(id);
+  },[activeTimer,elapsed]);
+
+  // Recurring tasks visible today
+  const recurringToday = useMemo(()=>
+    tasks.filter(t=>t.recur&&t.recur!=="none"&&taskRecursOn(t,todayISO)&&t.status!=="completed")
+  ,[tasks,todayISO]);
+
+  const addTask=()=>{ const t=input.trim(); if(!t) return; setTasks(prev=>[{id:Date.now(),text:t,priority,duration,status:"not started",recur,notes:""},...prev]); setInput(""); };
+  const deleteTask=id=>{ setTasks(prev=>prev.filter(t=>t.id!==id)); setCalBlocks(prev=>prev.filter(b=>b.taskId!==id)); if(activeTimer?.taskId===id) setActiveTimer(null); };
+  const updateTask=(id,patch)=>setTasks(prev=>prev.map(t=>t.id===id?{...t,...patch}:t));
+  const markComplete=id=>{ if(activeTimer?.taskId===id) clockOff(id); updateTask(id,{status:"completed"}); };
+  const removeBlock=bid=>setCalBlocks(prev=>prev.filter(b=>b.id!==bid));
+
+  const clockOff=(taskId)=>{
+    if(!activeTimer||activeTimer.taskId!==taskId) return;
+    const n=Date.now(), spent=n-activeTimer.startedAt, total=(elapsed[taskId]||0)+spent;
+    setElapsed(prev=>({...prev,[taskId]:total}));
+    setHistory(prev=>[...prev,{taskId,date:todayISO,startTime:activeTimer.startedAt,endTime:n,durationMs:spent}]);
+    setActiveTimer(null);
+    setCalBlocks(prev=>{ const ab=prev.find(b=>b.taskId===taskId); if(!ab) return prev; const orig=ab.origDurH??ab.durH; const dateBlocks=prev.filter(b=>b.date===ab.date); const otherBlocks=prev.filter(b=>b.date!==ab.date); return reflow(dateBlocks,taskId,activeTimer.clockOnH,Math.max(orig,msToH(total))).map(b=>b.taskId===taskId?{...b,origDurH:orig}:b).concat(otherBlocks); });
+  };
+
+  const clockOn=taskId=>{
+    const n=Date.now(), nowH=new Date(n).getHours()+new Date(n).getMinutes()/60, clockOnH=snapH(nowH);
+    if(activeTimer?.taskId===taskId){ clockOff(taskId); return; }
+    if(activeTimer?.startedAt) clockOff(activeTimer.taskId);
+    setCalBlocks(prev=>{ const w=prev.map(b=>({...b,origStart:b.origStart??b.startH,origDurH:b.origDurH??b.durH})); const ab=w.find(b=>b.taskId===taskId); if(!ab) return w; const dateBlocks=w.filter(b=>b.date===ab.date); const otherBlocks=w.filter(b=>b.date!==ab.date); return reflow(dateBlocks,taskId,clockOnH,ab.origDurH??ab.durH).concat(otherBlocks); });
+    setActiveTimer({taskId,startedAt:n,clockOnH});
+    updateTask(taskId,{status:"in progress"});
+  };
+
+  // Drag helpers
+  const clientYtoH=useCallback((cy,oy=0,dateStr)=>{
+    const ref=calRefs.current[dateStr||todayISO];
+    if(!ref) return CAL_START;
+    const r=ref.getBoundingClientRect();
+    return Math.max(CAL_START,Math.min(CAL_END-0.25,snapH(yToH(cy-r.top-oy))));
+  },[todayISO]);
+
+  const onDragOver=useCallback((e,dateStr)=>{
+    e.preventDefault();
+    let durH=0.5;
+    if(dragTask){const t=tasks.find(x=>x.id===dragTask);durH=t?t.duration/60:0.5;}
+    else if(dragBlock){const b=calBlocks.find(x=>x.id===dragBlock);durH=b?b.durH:0.5;}
+    setDragTargetDate(dateStr);
+    setDropPreview({startH:clientYtoH(e.clientY,dragOffsetY,dateStr),durH,date:dateStr});
+  },[dragTask,dragBlock,tasks,calBlocks,dragOffsetY,clientYtoH]);
+
+  const onDrop=useCallback((e,dateStr)=>{
+    e.preventDefault(); setDropPreview(null); setDragTargetDate(null);
+    const startH=clientYtoH(e.clientY,dragOffsetY,dateStr);
+    if(dragTask){
+      const task=tasks.find(t=>t.id===dragTask); if(!task) return;
+      const durH=task.duration/60;
+      setCalBlocks(prev=>[...prev.filter(b=>!(b.taskId===task.id&&b.date===dateStr)),{id:Date.now(),taskId:task.id,startH,durH,origDurH:durH,origStart:startH,date:dateStr}]);
+      setDragTask(null);
+    }else if(dragBlock){
+      setCalBlocks(prev=>prev.map(b=>b.id===dragBlock?{...b,startH,origStart:startH,pushed:false,date:dateStr}:b));
+      setDragBlock(null);
+    }
+    setDragOffsetY(0);
+  },[dragTask,dragBlock,tasks,dragOffsetY,clientYtoH]);
+
+  const getElapsed=tid=>{ const base=elapsed[tid]||0; return (activeTimer?.taskId===tid&&activeTimer?.startedAt)?base+(now-activeTimer.startedAt):base; };
+
+  const askAI=async prompt=>{
+    setAiLoading(true); setAiResponse("");
+    const tl=tasks.map((t,i)=>`${i+1}. [${t.priority}][${t.status}] ${t.text} (${fmtDur(t.duration)}${t.recur!=="none"?`, recurs ${t.recur}`:""})`).join("\n")||"None.";
+    const sc=calBlocks.filter(b=>b.date===todayISO).map(b=>{const t=tasks.find(x=>x.id===b.taskId);return t?`${t.text}: ${fmt(b.startH)}–${fmt(b.startH+b.durH)}`:""}).filter(Boolean).join("\n")||"Nothing today.";
+    try{
+      const res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:1000,messages:[{role:"user",content:`Productivity assistant.\nTasks:\n${tl}\nToday's schedule:\n${sc}\n\n${prompt}\n\nBe concise (3-6 sentences).`}]})});
+      const data=await res.json(); setAiResponse(data?.content?.find(b=>b.type==="text")?.text||"No response.");
+    }catch{ setAiResponse("Couldn't reach AI."); }
+    setAiLoading(false);
+  };
+
+  if(!user) return <LoginScreen onLogin={handleLogin}/>;
+
+  const nowH=new Date().getHours()+new Date().getMinutes()/60;
+  const pending=tasks.filter(t=>t.status!=="completed"&&(!t.recur||t.recur==="none"));
+  const scheduledIds=new Set(calBlocks.map(b=>b.taskId));
+
+  // ── Calendar column renderer ──────────────────────────
+  const CalColumn=({dateStr,label,isToday})=>{
+    const dayBlocks=calBlocks.filter(b=>b.date===dateStr);
+    const unscheduledRecurring=tasks.filter(t=>t.recur&&t.recur!=="none"&&taskRecursOn(t,dateStr)&&t.status!=="completed"&&!calBlocks.find(b=>b.taskId===t.id&&b.date===dateStr));
+    return (
+      <div style={{flex:1,minWidth:0}}>
+        <p style={{fontSize:11,fontWeight:600,color:isToday?"#185FA5":"#888",marginBottom:6,textAlign:"center",borderBottom:isToday?"2px solid #185FA5":"2px solid transparent",paddingBottom:3}}>{label}</p>
+        <div
+          ref={el=>calRefs.current[dateStr]=el}
+          onDrop={e=>onDrop(e,dateStr)}
+          onDragOver={e=>onDragOver(e,dateStr)}
+          onDragLeave={()=>{setDropPreview(null);setDragTargetDate(null);}}
+          style={{position:"relative",borderRadius:8,border:`0.5px solid ${isToday?"#378ADD":"#ddd"}`,background:"#fff",height:CAL_H,overflow:"visible"}}>
+          {Array.from({length:TOTAL_SLOTS},(_,i)=>{
+            const h=CAL_START+i*0.25,isHour=i%4===0,isHalf=i%4===2;
+            return <div key={i} style={{position:"absolute",top:i*SLOT_H,left:0,right:0,height:SLOT_H,boxSizing:"border-box",borderBottom:`0.5px solid ${isHour?"#bbb":isHalf?"#ddd":"#f0f0f0"}`}}>
+              {calView==="day"&&<span style={{position:"absolute",top:2,left:4,fontSize:isHour?11:9,color:"#aaa",opacity:isHour?1:isHalf?0.7:0.4,lineHeight:1,pointerEvents:"none"}}>{fmt(h)}</span>}
+            </div>;
+          })}
+          {isToday&&nowH>=CAL_START&&nowH<CAL_END&&<div style={{position:"absolute",top:hToY(nowH),left:0,right:0,height:2,background:"#e74c3c",zIndex:10,pointerEvents:"none"}}><div style={{width:8,height:8,borderRadius:"50%",background:"#e74c3c",position:"absolute",top:-3,left:calView==="day"?52:2}}/></div>}
+          {dropPreview&&dragTargetDate===dateStr&&<div style={{position:"absolute",top:hToY(dropPreview.startH)+1,left:calView==="day"?56:4,right:4,height:dropPreview.durH*HOUR_H-2,background:"rgba(100,100,220,0.1)",border:"1.5px dashed #99c",borderRadius:8,pointerEvents:"none",zIndex:6}}/>}
+          {dayBlocks.map(b=>{
+            const task=tasks.find(t=>t.id===b.taskId); if(!task||!task.status) return null;
+            const topPx=hToY(b.startH),heightPx=b.durH*HOUR_H,c=PC[task.priority],isActive=activeTimer?.taskId===task.id;
+            const el=getElapsed(task.id),origDurH=b.origDurH??b.durH;
+            const isOverrun=isActive&&msToH(el)>origDurH+0.01;
+            const s=SS[task.status]??SS["not started"];
+            const leftPx=calView==="day"?56:4;
+            return (
+              <div key={b.id} draggable onDragStart={e=>{setDragBlock(b.id);setDragTask(null);const r=e.currentTarget.getBoundingClientRect();setDragOffsetY(e.clientY-r.top);e.dataTransfer.effectAllowed="move";}}
+                style={{position:"absolute",top:topPx+1,left:leftPx,right:4,height:Math.max(heightPx-2,SLOT_H-1),background:c.cal,border:`0.5px solid ${c.border}`,borderLeft:isActive?`3px solid ${c.calText}`:`0.5px solid ${c.border}`,borderRadius:8,padding:"3px 5px 3px 7px",cursor:"grab",overflow:"visible",zIndex:5,boxSizing:"border-box",display:"flex",alignItems:"flex-start",gap:4}}>
+                <div style={{flex:1,minWidth:0,display:"flex",flexDirection:"column",gap:2,paddingTop:1}}>
+                  <div style={{display:"flex",alignItems:"center",gap:3,flexWrap:"wrap"}}>
+                    <span style={{fontSize:11,fontWeight:500,color:c.calText,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{task.text}</span>
+                    {isOverrun&&<span style={{fontSize:9,background:"#F7C1C1",color:"#791F1F",borderRadius:3,padding:"1px 4px"}}>overrun</span>}
+                    {b.pushed&&<span style={{fontSize:9,background:"#B5D4F4",color:"#185FA5",borderRadius:3,padding:"1px 4px"}}>pushed</span>}
+                  </div>
+                  <span style={{display:"inline-block",alignSelf:"flex-start",background:s.bg,color:s.text,border:`0.5px solid ${s.border}`,borderRadius:5,fontSize:9,padding:"1px 5px",fontWeight:500,whiteSpace:"nowrap"}}>{task.status}</span>
+                  <span style={{fontSize:9,color:c.calText,opacity:0.7,whiteSpace:"nowrap"}}>{fmt(b.startH)}–{fmt(b.startH+b.durH)}{el>0?` · ${fmtMs(el)}`:""}</span>
+                </div>
+                <div style={{display:"flex",flexDirection:"column",alignItems:"stretch",gap:2,flexShrink:0,paddingTop:1}}>
+                  {task.status!=="completed"&&<button onClick={()=>clockOn(task.id)} style={{fontSize:9,padding:"0 5px",height:20,background:isActive?"rgba(255,255,255,0.9)":"rgba(255,255,255,0.6)",border:`0.5px solid ${c.border}`,borderRadius:4,color:c.calText,fontWeight:500,whiteSpace:"nowrap",display:"flex",alignItems:"center",justifyContent:"center"}}>{isActive?"⏸":"▶"}</button>}
+                  {task.status!=="completed"&&<button onClick={()=>markComplete(task.id)} style={{fontSize:9,padding:"0 5px",height:20,background:"rgba(255,255,255,0.6)",border:"0.5px solid #97C459",borderRadius:4,color:"#3B6D11",fontWeight:500,display:"flex",alignItems:"center",justifyContent:"center"}}>✓</button>}
+                  <button onClick={()=>removeBlock(b.id)} style={{background:"none",border:"none",fontSize:11,color:c.calText,opacity:0.35,padding:0,lineHeight:1,textAlign:"center"}}>×</button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        {unscheduledRecurring.length>0&&calView==="week"&&(
+          <div style={{marginTop:4}}>
+            {unscheduledRecurring.map(t=>(
+              <div key={t.id} draggable onDragStart={e=>{setDragTask(t.id);setDragOffsetY(0);e.dataTransfer.effectAllowed="move";}}
+                style={{background:PC[t.priority].bg,border:`0.5px solid ${PC[t.priority].border}`,borderRadius:6,padding:"3px 6px",marginBottom:3,cursor:"grab",fontSize:10,color:PC[t.priority].calText}}>
+                🔁 {t.text}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div style={{maxWidth:calView==="week"?1100:740,margin:"0 auto",padding:"1rem"}}>
+      {/* Header */}
+      <div style={{display:"flex",gap:6,marginBottom:"1rem",alignItems:"center",flexWrap:"wrap"}}>
+        {["tasks","calendar","history","ai"].map(t=>(
+          <button key={t} onClick={()=>setTab(t)} style={{fontSize:13,padding:"5px 14px",fontWeight:tab===t?600:400,background:tab===t?"#f3f3f1":"transparent"}}>
+            {t==="tasks"?"Tasks":t==="calendar"?"Calendar":t==="history"?"History":"AI"}
+          </button>
+        ))}
+        {activeTimer&&<span style={{fontSize:12,color:"#185FA5",background:"#E6F1FB",border:"0.5px solid #378ADD",borderRadius:6,padding:"3px 10px"}}>⏱ {fmtMs(now-activeTimer.startedAt)}</span>}
+        <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:8}}>
+          {saveStatus==="saving"&&<span style={{fontSize:11,color:"#888"}}>Saving…</span>}
+          {saveStatus==="saved"&&<span style={{fontSize:11,color:"#3B6D11"}}>✓ Saved</span>}
+          {saveStatus==="error"&&<span style={{fontSize:11,color:"#c0392b"}}>Save failed</span>}
+          <span style={{fontSize:12,color:"#888"}}>@{user}</span>
+          <button onClick={()=>{setUser(null);setTasks([]);setCalBlocks([]);setElapsed({});setHistory([]);setActiveTimer(null);}} style={{fontSize:11,padding:"3px 8px"}}>Sign out</button>
+        </div>
+      </div>
+
+      {/* ── TASKS ── */}
+      {tab==="tasks"&&<>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,marginBottom:"1rem"}}>
+          {[["Total",tasks.length],["Not started",tasks.filter(t=>t.status==="not started").length],["In progress",tasks.filter(t=>t.status==="in progress").length],["Done",tasks.filter(t=>t.status==="completed").length]].map(([l,v])=>(
+            <div key={l} style={{background:"#f3f3f1",borderRadius:8,padding:"0.6rem 0.75rem"}}>
+              <p style={{fontSize:11,color:"#888",marginBottom:2}}>{l}</p>
+              <p style={{fontSize:20,fontWeight:600}}>{v}</p>
+            </div>
+          ))}
+        </div>
+        {recurringToday.length>0&&(
+          <div style={{background:"#E6F1FB",border:"0.5px solid #378ADD",borderRadius:10,padding:"0.6rem 1rem",marginBottom:"0.75rem",fontSize:12,color:"#185FA5"}}>
+            🔁 <strong>Recurring today:</strong> {recurringToday.map(t=>t.text).join(", ")}
+          </div>
+        )}
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:"0.75rem"}}>
+          <input value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addTask()} placeholder="Task name..." style={{flex:"1 1 150px"}}/>
+          <select value={priority} onChange={e=>setPriority(e.target.value)} style={{width:88}}>{PRIORITIES.map(p=><option key={p} value={p}>{p}</option>)}</select>
+          <select value={duration} onChange={e=>setDuration(Number(e.target.value))} style={{width:88}}>{[15,30,45,60,90,120,180,240].map(d=><option key={d} value={d}>{fmtDur(d)}</option>)}</select>
+          <select value={recur} onChange={e=>setRecur(e.target.value)} style={{width:100}}>{RECUR_OPTS.map(r=><option key={r} value={r}>{r==="none"?"no repeat":r}</option>)}</select>
+          <button onClick={addTask} style={{padding:"0 14px",fontWeight:500}}>Add</button>
+        </div>
+        <div style={{border:"0.5px solid #ddd",borderRadius:12,overflow:"hidden"}}>
+          {tasks.length===0&&<p style={{padding:"1.5rem",textAlign:"center",color:"#888",fontSize:13}}>No tasks yet.</p>}
+          {tasks.map((t,i)=>{
+            const el=getElapsed(t.id),isActive=activeTimer?.taskId===t.id,isDone=t.status==="completed",isEditing=editingId===t.id;
+            const s=SS[t.status]??SS["not started"];
+            return (
+              <div key={t.id} draggable={!isEditing} onDragStart={e=>{if(isEditing){e.preventDefault();return;}setDragTask(t.id);setDragOffsetY(0);e.dataTransfer.effectAllowed="move";}}
+                style={{borderBottom:i<tasks.length-1?"0.5px solid #eee":"none",background:isDone?"#f9f9f7":"#fff",opacity:isDone?0.7:1}}>
+                <div style={{display:"flex",alignItems:"center",gap:8,padding:"0.6rem 1rem",flexWrap:"wrap"}}>
+                  <span style={{cursor:"grab",color:"#aaa",fontSize:14}}>⠿</span>
+                  <span style={{flex:1,minWidth:120,fontSize:13,textDecoration:isDone?"line-through":"none"}}>{t.text}</span>
+                  {t.notes&&<span style={{fontSize:11,color:"#aaa",maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={t.notes}>📝 {t.notes}</span>}
+                  <span style={{fontSize:11,color:"#888",whiteSpace:"nowrap"}}>{fmtDur(t.duration)}</span>
+                  {t.recur&&t.recur!=="none"&&<span style={{fontSize:10,background:"#E6F1FB",color:"#185FA5",border:"0.5px solid #378ADD",borderRadius:4,padding:"1px 6px"}}>🔁 {t.recur}</span>}
+                  <Badge label={t.status} bg={s.bg} text={s.text} border={s.border}/>
+                  <Badge label={t.priority} bg={PC[t.priority].bg} text={PC[t.priority].text} border={PC[t.priority].border}/>
+                  {scheduledIds.has(t.id)&&<Badge label="on cal" bg="#E6F1FB" text="#185FA5" border="#378ADD"/>}
+                  {el>0&&<span style={{fontSize:11,color:"#888",whiteSpace:"nowrap"}}>{fmtMs(el)}</span>}
+                  <button onClick={()=>setEditingId(isEditing?null:t.id)} style={{fontSize:11,padding:"3px 7px",background:isEditing?"#f3f3f1":"transparent"}}>✎</button>
+                  {!isDone&&<button onClick={()=>clockOn(t.id)} style={{fontSize:11,padding:"3px 8px",background:isActive?"#E6F1FB":"transparent",color:isActive?"#185FA5":"#555",border:`0.5px solid ${isActive?"#378ADD":"#ccc"}`}}>{isActive?"⏸ pause":"▶ clock on"}</button>}
+                  {!isDone&&<button onClick={()=>markComplete(t.id)} style={{fontSize:11,padding:"3px 8px",color:"#3B6D11",border:"0.5px solid #97C459"}}>✓ done</button>}
+                  <button onClick={()=>deleteTask(t.id)} style={{background:"none",border:"none",fontSize:15,color:"#aaa",padding:"0 2px"}}>×</button>
+                </div>
+                {isEditing&&(
+                  <div style={{padding:"0.5rem 1rem 0.75rem 2.5rem",borderTop:"0.5px solid #eee",background:"#f9f9f7"}}>
+                    <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:10}}>
+                      <span style={{fontSize:12,color:"#888"}}>Priority</span>
+                      {PRIORITIES.map(p=><button key={p} onClick={()=>updateTask(t.id,{priority:p})} style={{fontSize:11,padding:"3px 10px",background:t.priority===p?PC[p].bg:"transparent",color:t.priority===p?PC[p].text:"#555",border:`0.5px solid ${t.priority===p?PC[p].border:"#ccc"}`,fontWeight:t.priority===p?600:400}}>{p}</button>)}
+                      <span style={{fontSize:12,color:"#888",marginLeft:8}}>Status</span>
+                      {["not started","in progress","completed"].map(s=>{const st=SS[s];return <button key={s} onClick={()=>updateTask(t.id,{status:s})} style={{fontSize:11,padding:"3px 10px",background:t.status===s?st.bg:"transparent",color:t.status===s?st.text:"#555",border:`0.5px solid ${t.status===s?st.border:"#ccc"}`,fontWeight:t.status===s?600:400}}>{s}</button>;})}
+                    </div>
+                    <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:10}}>
+                      <span style={{fontSize:12,color:"#888"}}>Duration</span>
+                      <select value={t.duration} onChange={e=>updateTask(t.id,{duration:Number(e.target.value)})} style={{width:80}}>{[15,30,45,60,90,120,180,240].map(d=><option key={d} value={d}>{fmtDur(d)}</option>)}</select>
+                      <span style={{fontSize:12,color:"#888",marginLeft:8}}>Repeats</span>
+                      <select value={t.recur||"none"} onChange={e=>updateTask(t.id,{recur:e.target.value})} style={{width:110}}>{RECUR_OPTS.map(r=><option key={r} value={r}>{r==="none"?"no repeat":r}</option>)}</select>
+                    </div>
+                    <div>
+                      <label style={{fontSize:12,color:"#888",display:"block",marginBottom:4}}>Notes</label>
+                      <textarea value={t.notes||""} onChange={e=>updateTask(t.id,{notes:e.target.value})} placeholder="Add notes…" style={{width:"100%",fontSize:12,minHeight:60}}/>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        <p style={{fontSize:11,color:"#aaa",marginTop:8,textAlign:"center"}}>Drag tasks onto the Calendar to schedule them</p>
+      </>}
+
+      {/* ── CALENDAR ── */}
+      {tab==="calendar"&&(
+        <div>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:"0.75rem",flexWrap:"wrap"}}>
+            <div style={{display:"flex",gap:4}}>
+              <button onClick={()=>setCalView("day")} style={{fontSize:12,padding:"4px 12px",fontWeight:calView==="day"?600:400,background:calView==="day"?"#f3f3f1":"transparent"}}>Day</button>
+              <button onClick={()=>setCalView("week")} style={{fontSize:12,padding:"4px 12px",fontWeight:calView==="week"?600:400,background:calView==="week"?"#f3f3f1":"transparent"}}>Week</button>
+            </div>
+            {calView==="week"&&<>
+              <button onClick={()=>{const d=new Date(weekRef);d.setDate(d.getDate()-7);setWeekRef(d);}} style={{fontSize:12,padding:"4px 10px"}}>← Prev</button>
+              <button onClick={()=>setWeekRef(new Date())} style={{fontSize:12,padding:"4px 10px"}}>This week</button>
+              <button onClick={()=>{const d=new Date(weekRef);d.setDate(d.getDate()+7);setWeekRef(d);}} style={{fontSize:12,padding:"4px 10px"}}>Next →</button>
+            </>}
+            {calView==="day"&&<span style={{fontSize:12,color:"#888"}}>{new Date().toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long"})}</span>}
+          </div>
+
+          {calView==="day"&&(
+            <div style={{display:"flex",gap:12}}>
+              <div style={{width:130,flexShrink:0}}>
+                <p style={{fontSize:12,fontWeight:600,color:"#888",marginBottom:8}}>UNSCHEDULED</p>
+                {pending.filter(t=>!calBlocks.find(b=>b.taskId===t.id&&b.date===todayISO)).map(t=>(
+                  <div key={t.id} draggable onDragStart={e=>{setDragTask(t.id);setDragOffsetY(0);e.dataTransfer.effectAllowed="move";}}
+                    style={{background:PC[t.priority].bg,border:`0.5px solid ${PC[t.priority].border}`,borderRadius:8,padding:"6px 8px",marginBottom:6,cursor:"grab"}}>
+                    <div style={{fontSize:12,fontWeight:500,color:PC[t.priority].calText}}>{t.text}</div>
+                    <div style={{fontSize:11,color:PC[t.priority].calText,opacity:0.75}}>{fmtDur(t.duration)}</div>
+                  </div>
+                ))}
+                {recurringToday.filter(t=>!calBlocks.find(b=>b.taskId===t.id&&b.date===todayISO)).map(t=>(
+                  <div key={t.id} draggable onDragStart={e=>{setDragTask(t.id);setDragOffsetY(0);e.dataTransfer.effectAllowed="move";}}
+                    style={{background:PC[t.priority].bg,border:`0.5px solid ${PC[t.priority].border}`,borderRadius:8,padding:"6px 8px",marginBottom:6,cursor:"grab"}}>
+                    <div style={{fontSize:12,fontWeight:500,color:PC[t.priority].calText}}>🔁 {t.text}</div>
+                    <div style={{fontSize:11,color:PC[t.priority].calText,opacity:0.75}}>{fmtDur(t.duration)}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{flex:1}}>
+                <CalColumn dateStr={todayISO} label={new Date().toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"short"}).toUpperCase()} isToday={true}/>
+              </div>
+            </div>
+          )}
+
+          {calView==="week"&&(
+            <div style={{display:"flex",gap:6}}>
+              <div style={{width:52,flexShrink:0,paddingTop:36}}>
+                {Array.from({length:TOTAL_SLOTS},(_,i)=>{
+                  const h=CAL_START+i*0.25,isHour=i%4===0;
+                  return <div key={i} style={{height:SLOT_H,display:"flex",alignItems:"flex-start"}}>
+                    {isHour&&<span style={{fontSize:10,color:"#aaa",lineHeight:1,paddingTop:2}}>{fmt(h)}</span>}
+                  </div>;
+                })}
+              </div>
+              {weekDays.map(d=>{
+                const ds=toDateStr(d), isToday=ds===todayISO;
+                return <CalColumn key={ds} dateStr={ds} label={`${DAYS[d.getDay()-1].slice(0,3).toUpperCase()} ${d.getDate()}`} isToday={isToday}/>;
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── HISTORY ── */}
+      {tab==="history"&&<HistoryTab history={history} tasks={tasks}/>}
+
+      {/* ── AI ── */}
+      {tab==="ai"&&(
+        <div>
+          <div style={{border:"0.5px solid #ddd",borderRadius:12,padding:"1rem 1.25rem",marginBottom:"1rem"}}>
+            <p style={{fontSize:13,fontWeight:500,marginBottom:10}}>Ask about your tasks & schedule</p>
+            <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+              {[["What should I tackle first?","What should I tackle first? ↗"],["Is my schedule realistic?","Is my schedule realistic? ↗"],["Break down my top task","Break down my top task ↗"],["Am I overloaded today?","Am I overloaded today? ↗"]].map(([p,l])=>(
+                <button key={l} onClick={()=>askAI(p)} style={{fontSize:12,padding:"5px 12px"}} disabled={aiLoading}>{l}</button>
+              ))}
+            </div>
+          </div>
+          {aiLoading&&<p style={{fontSize:13,color:"#888"}}>Thinking…</p>}
+          {aiResponse&&!aiLoading&&<div style={{background:"#f9f9f7",borderRadius:10,padding:"1rem 1.25rem",fontSize:13,lineHeight:1.7}}>{aiResponse}</div>}
+          {!aiLoading&&!aiResponse&&<p style={{fontSize:13,color:"#888"}}>Tap a question above to get AI advice.</p>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
